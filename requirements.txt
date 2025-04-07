@@ -1,0 +1,12 @@
+asgiref==3.8.1
+Django==5.2
+django-cors-headers==4.7.0
+djangorestframework==3.16.0
+dnspython==2.7.0
+kafka-python==2.1.5
+paho-mqtt==2.1.0
+py4j==0.10.9.7
+pymongo==4.11.3
+pyspark==3.5.5
+pytz==2025.2
+sqlparse==0.5.3
