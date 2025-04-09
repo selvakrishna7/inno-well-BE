@@ -203,6 +203,20 @@ def get_voltage_stats(request):
 
 
 
+from datetime import datetime, timedelta
+from django.http import JsonResponse
+from dateutil import parser  # safer parsing
+from pymongo import ASCENDING
+from datetime import datetime, timedelta
+
+IST = pytz.timezone('Asia/Kolkata')
+from django.http import JsonResponse
+from datetime import datetime, timedelta
+from pymongo import ASCENDING
+from pytz import timezone
+
+IST = timezone("Asia/Kolkata")
+
 def get_ghg_emission(request):
     owner_name = request.GET.get('owner')
     interval = request.GET.get('range')
@@ -219,33 +233,63 @@ def get_ghg_emission(request):
     if not owner_name or interval not in ['min', 'hr', 'day', 'month', 'year']:
         return JsonResponse({'error': 'Invalid or missing parameters'}, status=400)
 
-    date_format_map = {
-        "min": "%Y-%m-%d %H:%M",
-        "hr": "%Y-%m-%d %H:00",
-        "day": "%Y-%m-%d",
-        "month": "%Y-%m",
-        "year": "%Y"
-    }
-
     now = datetime.now(IST)
-    if interval == 'min':
-        from_time = now - timedelta(minutes=60)
-    elif interval == 'hr':
-        from_time = now - timedelta(hours=24)
-    elif interval == 'day':
-        from_time = now - timedelta(days=30)
-    elif interval == 'month':
-        from_time = now.replace(day=1) - timedelta(days=365)
-    elif interval == 'year':
-        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
 
-    from_time_utc = from_time.astimezone(IST)
+    if interval == 'min':
+        from_time = now.replace(second=0, microsecond=0) - timedelta(minutes=59)
+        to_time = now
+        date_format = "%Y-%m-%d %H:%M"
+        time_slots = [(from_time + timedelta(minutes=i)).strftime(date_format) for i in range(60)]
+
+    elif interval == 'hr':
+        from_time = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
+        to_time = now
+        date_format = "%Y-%m-%d %H:00"
+        time_slots = [(from_time + timedelta(hours=i)).strftime(date_format) for i in range(24)]
+
+    elif interval == 'day':
+        from_time = now.replace(hour=0, minute=0, second=0, microsecond=0).replace(day=1)
+        to_time = now
+        total_days = (now - from_time).days + 1
+        date_format = "%Y-%m-%d"
+        time_slots = [(from_time + timedelta(days=i)).strftime(date_format) for i in range(total_days)]
+
+    elif interval == 'month':
+        from_time = now.replace(day=1, month=1, hour=0, minute=0, second=0, microsecond=0)
+        to_time = now
+        date_format = "%Y-%m"
+        time_slots = []
+        for i in range(1, now.month + 1):
+            time_slots.append(datetime(now.year, i, 1).strftime(date_format))
+
+    elif interval == 'year':
+        first_doc = collection.find_one({
+            "owner_name": owner_name,
+            "value_name": "energy_consumption"
+        }, sort=[("time", ASCENDING)])
+
+        if not first_doc:
+            return JsonResponse({
+                "owner_name": owner_name,
+                "interval": interval,
+                "data": []
+            })
+
+        earliest_time = datetime.strptime(first_doc["time"], "%Y-%m-%d %H:%M:%S")
+        from_time = earliest_time.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        to_time = now
+        date_format = "%Y"
+        time_slots = [str(y) for y in range(from_time.year, now.year + 1)]
 
     pipeline = [
         {
             "$match": {
                 "owner_name": owner_name,
-                "value_name": "energy_consumption"
+                "value_name": "energy_consumption",
+                "time": {
+                    "$gte": from_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "$lte": to_time.strftime("%Y-%m-%d %H:%M:%S")
+                }
             }
         },
         {
@@ -254,54 +298,56 @@ def get_ghg_emission(request):
             }
         },
         {
-            "$match": {
-                "parsed_time": { "$gte": from_time_utc }
-            }
-        },
-        {
-            "$group": {
-                "_id": {
+            "$project": {
+                "value": 1,
+                "bucket": {
                     "$dateToString": {
-                        "format": date_format_map[interval],
+                        "format": date_format,
                         "date": "$parsed_time",
                         "timezone": "Asia/Kolkata"
                     }
                 },
-                "avg_energy": { "$avg": "$value" }
+                "parsed_time": 1
+            }
+        },
+        {
+            "$sort": { "parsed_time": 1 }
+        },
+        {
+            "$group": {
+                "_id": "$bucket",
+                "first_energy": { "$first": "$value" },
+                "last_energy": { "$last": "$value" }
             }
         },
         {
             "$project": {
                 "_id": 0,
                 "time": "$_id",
-                "energy": { "$round": ["$avg_energy", 6] }
+                "ghg_emission": {
+                    "$round": [{ "$multiply": [
+                        { "$max": [{ "$subtract": ["$last_energy", "$first_energy"] }, 0] },
+                        0.00058
+                    ]}, 6]
+                }
             }
-        },
-        {
-            "$sort": { "time": 1 }
         }
     ]
 
-    raw_results = list(collection.aggregate(pipeline))
+    results = list(collection.aggregate(pipeline))
 
-    # Compute difference-based GHG
-    ghg_results = []
-    prev_energy = None
-    for entry in raw_results:
-        if prev_energy is not None:
-            diff = round(entry['energy'] - prev_energy, 6)
-            ghg = round(diff * 0.00058, 6)
-            ghg_results.append({
-                "time": entry['time'],
-                "ghg_emission": max(ghg, 0)  # Ensure no negative emissions
-            })
-        prev_energy = entry['energy']
+    # Make sure all expected time slots are included (even with 0 emission)
+    ghg_dict = {r["time"]: r["ghg_emission"] for r in results}
+    final_result = [{"time": slot, "ghg_emission": ghg_dict.get(slot, 0)} for slot in time_slots]
 
     return JsonResponse({
         "owner_name": owner_name,
         "interval": interval,
-        "data": ghg_results
+        "data": final_result
     })
+
+
+
 import pytz
 IST = pytz.timezone('Asia/Kolkata')
 def get_energy_consumption(request):
@@ -329,18 +375,37 @@ def get_energy_consumption(request):
     }
 
     now = datetime.now(IST)
-    if interval == 'min':
-        from_time = now - timedelta(minutes=60)
-    elif interval == 'hr':
-        from_time = now - timedelta(hours=24)
-    elif interval == 'day':
-        from_time = now - timedelta(days=30)
-    elif interval == 'month':
-        from_time = now - timedelta(days=365)
-    elif interval == 'year':
-        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
 
-    from_time_utc = from_time.astimezone(IST)
+    if interval == 'min':
+        start = now.replace(second=0, microsecond=0, minute=0)
+        end = start + timedelta(hours=1)
+    elif interval == 'hr':
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+    elif interval == 'day':
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if now.month == 12:
+            end = start.replace(year=now.year + 1, month=1)
+        else:
+            end = start.replace(month=now.month + 1)
+    elif interval == 'month':
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = start.replace(year=start.year + 1)
+    elif interval == 'year':
+        match_stage = {
+            "$match": {
+                "owner_name": owner_name,
+                "value_name": "energy_consumption"
+            }
+        }
+        time_add = {"$addFields": {"parsed_time": {"$toDate": "$time"}}}
+        sort_stage = {"$sort": {"parsed_time": 1}}
+        limit_stage = {"$limit": 1}
+        earliest = list(collection.aggregate([match_stage, time_add, sort_stage, limit_stage]))
+        if not earliest:
+            return JsonResponse({"owner_name": owner_name, "interval": interval, "data": []})
+        start = earliest[0]['parsed_time']
+        end = now
 
     pipeline = [
         {
@@ -356,8 +421,11 @@ def get_energy_consumption(request):
         },
         {
             "$match": {
-                "parsed_time": {"$gte": from_time_utc}
+                "parsed_time": {"$gte": start, "$lt": end}
             }
+        },
+        {
+            "$sort": {"parsed_time": 1}
         },
         {
             "$group": {
@@ -368,14 +436,15 @@ def get_energy_consumption(request):
                         "timezone": "Asia/Kolkata"
                     }
                 },
-                "avg_energy": {"$avg": "$value"}
+                "first": {"$first": "$value"},
+                "last": {"$last": "$value"}
             }
         },
         {
             "$project": {
                 "_id": 0,
                 "time": "$_id",
-                "energy": {"$round": ["$avg_energy", 6]}
+                "energy": {"$round": [{"$subtract": ["$last", "$first"]}, 6]}
             }
         },
         {
@@ -383,25 +452,47 @@ def get_energy_consumption(request):
         }
     ]
 
-    raw_results = list(collection.aggregate(pipeline))
+    results = list(collection.aggregate(pipeline))
 
-    # Compute energy difference: current - previous
-    diff_results = []
-    prev_energy = None
-    for entry in raw_results:
-        if prev_energy is not None:
-            energy_diff = round(entry['energy'] - prev_energy, 6)
-            diff_results.append({
-                "time": entry['time'],
-                "energy": max(energy_diff, 0)
-            })
-        prev_energy = entry['energy']
+    full_range = []
+    if interval == 'min':
+        for i in range(60):
+            t = (start + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M")
+            full_range.append(t)
+    elif interval == 'hr':
+        for i in range(24):
+            t = (start + timedelta(hours=i)).strftime("%Y-%m-%d %H:00")
+            full_range.append(t)
+    elif interval == 'day':
+        day_count = (end - start).days
+        for i in range(day_count):
+            t = (start + timedelta(days=i)).strftime("%Y-%m-%d")
+            full_range.append(t)
+    elif interval == 'month':
+        year = now.year
+        for i in range(1, 13):
+            full_range.append(f"{year}-{i:02}")
+    elif interval == 'year':
+        year_start = start.year
+        year_end = now.year
+        for y in range(year_start, year_end + 1):
+            full_range.append(str(y))
+
+    final_data = []
+    result_dict = {item['time']: item['energy'] for item in results}
+
+    for t in full_range:
+        final_data.append({
+            "time": t,
+            "energy": result_dict.get(t, 0)
+        })
 
     return JsonResponse({
         "owner_name": owner_name,
         "interval": interval,
-        "data": diff_results
+        "data": final_data
     })
+
 
 
 
@@ -411,7 +502,6 @@ def get_power_factor(request):
     owner_name = request.GET.get('owner')
     interval = request.GET.get('range')
 
-    # Interval mapping
     interval_map = {
         'm': 'min',
         'h': 'hr',
@@ -433,18 +523,37 @@ def get_power_factor(request):
     }
 
     now = datetime.now(IST)
-    if interval == 'min':
-        from_time = now - timedelta(minutes=60)
-    elif interval == 'hr':
-        from_time = now - timedelta(hours=24)
-    elif interval == 'day':
-        from_time = now - timedelta(days=30)
-    elif interval == 'month':
-        from_time = now.replace(day=1) - timedelta(days=365)
-    elif interval == 'year':
-        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
 
-    from_time_utc = from_time.astimezone(IST)
+    if interval == 'min':
+        start = now.replace(second=0, microsecond=0, minute=0)
+        end = start + timedelta(hours=1)
+    elif interval == 'hr':
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+    elif interval == 'day':
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if now.month == 12:
+            end = start.replace(year=now.year + 1, month=1)
+        else:
+            end = start.replace(month=now.month + 1)
+    elif interval == 'month':
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = start.replace(year=start.year + 1)
+    elif interval == 'year':
+        match_stage = {
+            "$match": {
+                "owner_name": owner_name,
+                "value_name": "powerfactor"
+            }
+        }
+        time_add = {"$addFields": {"parsed_time": {"$toDate": "$time"}}}
+        sort_stage = {"$sort": {"parsed_time": 1}}
+        limit_stage = {"$limit": 1}
+        earliest = list(collection.aggregate([match_stage, time_add, sort_stage, limit_stage]))
+        if not earliest:
+            return JsonResponse({"owner_name": owner_name, "interval": interval, "data": []})
+        start = earliest[0]['parsed_time']
+        end = now
 
     pipeline = [
         {
@@ -455,12 +564,12 @@ def get_power_factor(request):
         },
         {
             "$addFields": {
-                "parsed_time": { "$toDate": "$time" }
+                "parsed_time": {"$toDate": "$time"}
             }
         },
         {
             "$match": {
-                "parsed_time": { "$gte": from_time_utc }
+                "parsed_time": {"$gte": start, "$lt": end}
             }
         },
         {
@@ -472,18 +581,18 @@ def get_power_factor(request):
                         "timezone": "Asia/Kolkata"
                     }
                 },
-                "avg_power_factor": { "$avg": "$value" }
+                "avg_power_factor": {"$avg": "$value"}
             }
         },
         {
             "$project": {
                 "_id": 0,
                 "time": "$_id",
-                "power_factor": { "$round": ["$avg_power_factor", 3] }
+                "power_factor": {"$round": ["$avg_power_factor", 3]}
             }
         },
         {
-            "$sort": { "time": 1 }
+            "$sort": {"time": 1}
         }
     ]
 
@@ -499,7 +608,6 @@ def get_current_stats(request):
     owner_name = request.GET.get('owner')
     interval = request.GET.get('range')
 
-    # Interval mapping
     interval_map = {
         'm': 'min',
         'h': 'hr',
@@ -521,18 +629,37 @@ def get_current_stats(request):
     }
 
     now = datetime.now(IST)
-    if interval == 'min':
-        from_time = now - timedelta(minutes=60)
-    elif interval == 'hr':
-        from_time = now - timedelta(hours=24)
-    elif interval == 'day':
-        from_time = now - timedelta(days=30)
-    elif interval == 'month':
-        from_time = now.replace(day=1) - timedelta(days=365)
-    elif interval == 'year':
-        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
 
-    from_time_utc = from_time.astimezone(IST)
+    if interval == 'min':
+        start = now.replace(second=0, microsecond=0, minute=0)
+        end = start + timedelta(hours=1)
+    elif interval == 'hr':
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+    elif interval == 'day':
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if now.month == 12:
+            end = start.replace(year=now.year + 1, month=1)
+        else:
+            end = start.replace(month=now.month + 1)
+    elif interval == 'month':
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = start.replace(year=start.year + 1)
+    elif interval == 'year':
+        match_stage = {
+            "$match": {
+                "owner_name": owner_name,
+                "value_name": {"$in": ["current1", "current2", "current3"]}
+            }
+        }
+        time_add = {"$addFields": {"parsed_time": {"$toDate": "$time"}}}
+        sort_stage = {"$sort": {"parsed_time": 1}}
+        limit_stage = {"$limit": 1}
+        earliest = list(collection.aggregate([match_stage, time_add, sort_stage, limit_stage]))
+        if not earliest:
+            return JsonResponse({"owner_name": owner_name, "interval": interval, "data": []})
+        start = earliest[0]['parsed_time']
+        end = now
 
     pipeline = [
         {
@@ -543,12 +670,12 @@ def get_current_stats(request):
         },
         {
             "$addFields": {
-                "parsed_time": { "$toDate": "$time" }
+                "parsed_time": {"$toDate": "$time"}
             }
         },
         {
             "$match": {
-                "parsed_time": { "$gte": from_time_utc }
+                "parsed_time": {"$gte": start, "$lt": end}
             }
         },
         {
@@ -563,14 +690,14 @@ def get_current_stats(request):
                     },
                     "phase": "$value_name"
                 },
-                "avg_value": { "$avg": "$value" }
+                "avg_value": {"$avg": "$value"}
             }
         },
         {
             "$project": {
                 "time": "$_id.time",
                 "phase": "$_id.phase",
-                "value": { "$round": ["$avg_value", 2] }
+                "value": {"$round": ["$avg_value", 2]}
             }
         },
         {
@@ -609,7 +736,7 @@ def get_current_stats(request):
             }
         },
         {
-            "$sort": { "time": 1 }
+            "$sort": {"time": 1}
         }
     ]
 
@@ -626,7 +753,6 @@ def get_frequency_stats(request):
     owner_name = request.GET.get('owner')
     interval = request.GET.get('range')
 
-    # Interval mapping
     interval_map = {
         'm': 'min',
         'h': 'hr',
@@ -648,18 +774,37 @@ def get_frequency_stats(request):
     }
 
     now = datetime.now(IST)
-    if interval == 'min':
-        from_time = now - timedelta(minutes=60)
-    elif interval == 'hr':
-        from_time = now - timedelta(hours=24)
-    elif interval == 'day':
-        from_time = now - timedelta(days=30)
-    elif interval == 'month':
-        from_time = now.replace(day=1) - timedelta(days=365)
-    elif interval == 'year':
-        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
 
-    from_time_utc = from_time.astimezone(IST)
+    if interval == 'min':
+        start = now.replace(second=0, microsecond=0, minute=0)
+        end = start + timedelta(hours=1)
+    elif interval == 'hr':
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+    elif interval == 'day':
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if now.month == 12:
+            end = start.replace(year=now.year + 1, month=1)
+        else:
+            end = start.replace(month=now.month + 1)
+    elif interval == 'month':
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = start.replace(year=start.year + 1)
+    elif interval == 'year':
+        match_stage = {
+            "$match": {
+                "owner_name": owner_name,
+                "value_name": "frequency"
+            }
+        }
+        time_add = {"$addFields": {"parsed_time": {"$toDate": "$time"}}}
+        sort_stage = {"$sort": {"parsed_time": 1}}
+        limit_stage = {"$limit": 1}
+        earliest = list(collection.aggregate([match_stage, time_add, sort_stage, limit_stage]))
+        if not earliest:
+            return JsonResponse({"owner_name": owner_name, "interval": interval, "data": []})
+        start = earliest[0]['parsed_time']
+        end = now
 
     pipeline = [
         {
@@ -675,7 +820,7 @@ def get_frequency_stats(request):
         },
         {
             "$match": {
-                "parsed_time": {"$gte": from_time_utc}
+                "parsed_time": {"$gte": start, "$lt": end}
             }
         },
         {
