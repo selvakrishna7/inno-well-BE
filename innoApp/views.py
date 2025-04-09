@@ -1,6 +1,7 @@
 from django.shortcuts import render
 from datetime import datetime
 import pytz
+from datetime import datetime, timedelta
 # yourapp/views.py
 from django.http import HttpResponse
 from django.http import JsonResponse
@@ -77,8 +78,6 @@ def get_energy_stats(request):
     unit_cost = 8.25
 
     try:
-        print(start_of_day.strftime("%Y-%m-%d %H:%M:%S"),".....................")
-        print(now.strftime("%Y-%m-%d %H:%M:%S"),".....................")
         one_day_energy = compute_energy_consumption(owner_name, start_of_day, now)
         one_month_energy = compute_energy_consumption(owner_name, start_of_month, now)
         one_year_energy = compute_energy_consumption(owner_name, start_of_year, now)
@@ -96,24 +95,22 @@ def get_energy_stats(request):
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
 
-
 def get_voltage_stats(request):
     owner_name = request.GET.get('owner')
-    interval = request.GET.get('range')  # default: day
-    if interval == 'm':
-        interval = 'min'
-    elif interval == 'h':
-        interval = 'hr'
-    elif interval == 'd':
-        interval = 'month'
-    elif interval == 'M':
-        interval = 'month'
-    elif interval == 'y':
-        interval = 'year'
+    interval = request.GET.get('range')
+
+    interval_map = {
+        'm': 'min',
+        'h': 'hr',
+        'd': 'day',
+        'M': 'month',
+        'y': 'year'
+    }
+    interval = interval_map.get(interval, interval)
+
     if not owner_name or interval not in ['min', 'hr', 'day', 'month', 'year']:
         return JsonResponse({'error': 'Invalid or missing parameters'}, status=400)
 
-    # Map intervals to MongoDB date formats
     date_format_map = {
         "min": "%Y-%m-%d %H:%M",
         "hr": "%Y-%m-%d %H:00",
@@ -122,30 +119,50 @@ def get_voltage_stats(request):
         "year": "%Y"
     }
 
+    now = datetime.now(IST)
+    if interval == 'min':
+        from_time = now - timedelta(minutes=60)
+    elif interval == 'hr':
+        from_time = now - timedelta(hours=24)
+    elif interval == 'day':
+        from_time = now - timedelta(days=30)
+    elif interval == 'month':
+        from_time = now.replace(day=1) - timedelta(days=365)
+    elif interval == 'year':
+        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
+
+    from_time_utc = from_time.astimezone(IST)
+
     pipeline = [
         {
             "$match": {
                 "owner_name": owner_name,
-                "value_name": {"$in": ["volt1", "volt2", "volt3"]}
+                "value_name": { "$in": ["volt1", "volt2", "volt3"] }
             }
         },
         {
             "$addFields": {
-                "group_time": {
-                    "$dateToString": {
-                        "format": date_format_map[interval],
-                        "date": {"$toDate": "$time"}
-                    }
-                }
+                "parsed_time": { "$toDate": "$time" }
+            }
+        },
+        {
+            "$match": {
+                "parsed_time": { "$gte": from_time_utc }
             }
         },
         {
             "$group": {
                 "_id": {
-                    "time": "$group_time",
+                    "time": {
+                        "$dateToString": {
+                            "format": date_format_map[interval],
+                            "date": "$parsed_time",
+                            "timezone": "Asia/Kolkata"
+                        }
+                    },
                     "volt": "$value_name"
                 },
-                "avg_value": {"$avg": "$value"}
+                "avg_value": { "$avg": "$value" }
             }
         },
         {
@@ -160,7 +177,7 @@ def get_voltage_stats(request):
             }
         },
         {
-            "$sort": {"_id": 1}
+            "$sort": { "_id": 1 }
         }
     ]
 
@@ -185,83 +202,11 @@ def get_voltage_stats(request):
     })
 
 
+
 def get_ghg_emission(request):
     owner_name = request.GET.get('owner')
     interval = request.GET.get('range')
-    if interval == 'm':
-        interval = 'min'
-    elif interval == 'h':
-        interval = 'hr'
-    elif interval == 'd':
-        interval = 'month'
-    elif interval == 'M':
-        interval = 'month'
-    elif interval == 'y':
-        interval = 'year'
-    if not owner_name or interval not in  ['min', 'hr', 'day', 'month', 'year']:
-        return JsonResponse({'error': 'Invalid or missing parameters'}, status=400)
 
-    date_format_map = {
-        "min": "%Y-%m-%d %H:%M",
-        "hr": "%Y-%m-%d %H:00",
-        "day": "%Y-%m-%d",
-        "month": "%Y-%m",
-        "year": "%Y"
-    }
-
-    pipeline = [
-        {
-            "$match": {
-                "owner_name": owner_name,
-                "value_name": "energy_consumption"
-            }
-        },
-        {
-            "$addFields": {
-                "group_time": {
-                    "$dateToString": {
-                        "format": date_format_map[interval],
-                        "date": {"$toDate": "$time"}
-                    }
-                }
-            }
-        },
-        {
-            "$group": {
-                "_id": "$group_time",
-                "min_energy": {"$min": "$value"},
-                "max_energy": {"$max": "$value"}
-            }
-        },
-        {
-            "$project": {
-                "time": "$_id",
-                # "energy_diff": {"$subtract": ["$max_energy", "$min_energy"]},
-                "ghg_emission": {
-                    "$round": [{"$multiply": [{"$subtract": ["$max_energy", "$min_energy"]}, 0.00058]}, 6]
-                }
-            }
-        },
-        {
-            "$sort": {"time": 1}
-        }
-    ]
-
-    results = list(collection.aggregate(pipeline))
-
-    return JsonResponse({
-        "owner_name": owner_name,
-        "interval": interval,
-        "data": results
-    })
-
-
-
-def get_energy_consumption(request):
-    owner_name = request.GET.get('owner')
-    interval = request.GET.get('range')
-
-    # Map shorthand interval to full
     interval_map = {
         'm': 'min',
         'h': 'hr',
@@ -282,6 +227,20 @@ def get_energy_consumption(request):
         "year": "%Y"
     }
 
+    now = datetime.now(IST)
+    if interval == 'min':
+        from_time = now - timedelta(minutes=60)
+    elif interval == 'hr':
+        from_time = now - timedelta(hours=24)
+    elif interval == 'day':
+        from_time = now - timedelta(days=30)
+    elif interval == 'month':
+        from_time = now.replace(day=1) - timedelta(days=365)
+    elif interval == 'year':
+        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
+
+    from_time_utc = from_time.astimezone(IST)
+
     pipeline = [
         {
             "$match": {
@@ -291,36 +250,132 @@ def get_energy_consumption(request):
         },
         {
             "$addFields": {
-                "group_time": {
-                    "$dateToString": {
-                        "format": date_format_map[interval],
-                        "date": {"$toDate": "$time"}
-                    }
-                }
+                "parsed_time": { "$toDate": "$time" }
+            }
+        },
+        {
+            "$match": {
+                "parsed_time": { "$gte": from_time_utc }
             }
         },
         {
             "$group": {
-                "_id": "$group_time",
-                "min_energy": {"$min": "$value"},
-                "max_energy": {"$max": "$value"}
+                "_id": {
+                    "$dateToString": {
+                        "format": date_format_map[interval],
+                        "date": "$parsed_time",
+                        "timezone": "Asia/Kolkata"
+                    }
+                },
+                "avg_energy": { "$avg": "$value" }
             }
         },
         {
             "$project": {
+                "_id": 0,
                 "time": "$_id",
-                "energy_diff": {
-                    "$subtract": ["$max_energy", "$min_energy"]
+                "energy": { "$round": ["$avg_energy", 6] }
+            }
+        },
+        {
+            "$sort": { "time": 1 }
+        }
+    ]
+
+    raw_results = list(collection.aggregate(pipeline))
+
+    # Compute difference-based GHG
+    ghg_results = []
+    prev_energy = None
+    for entry in raw_results:
+        if prev_energy is not None:
+            diff = round(entry['energy'] - prev_energy, 6)
+            ghg = round(diff * 0.00058, 6)
+            ghg_results.append({
+                "time": entry['time'],
+                "ghg_emission": max(ghg, 0)  # Ensure no negative emissions
+            })
+        prev_energy = entry['energy']
+
+    return JsonResponse({
+        "owner_name": owner_name,
+        "interval": interval,
+        "data": ghg_results
+    })
+import pytz
+IST = pytz.timezone('Asia/Kolkata')
+def get_energy_consumption(request):
+    owner_name = request.GET.get('owner')
+    interval = request.GET.get('range')
+
+    interval_map = {
+        'm': 'min',
+        'h': 'hr',
+        'd': 'day',
+        'M': 'month',
+        'y': 'year'
+    }
+    interval = interval_map.get(interval, interval)
+
+    if not owner_name or interval not in ['min', 'hr', 'day', 'month', 'year']:
+        return JsonResponse({'error': 'Invalid or missing parameters'}, status=400)
+
+    date_format_map = {
+        "min": "%Y-%m-%d %H:%M",
+        "hr": "%Y-%m-%d %H:00",
+        "day": "%Y-%m-%d",
+        "month": "%Y-%m",
+        "year": "%Y"
+    }
+
+    now = datetime.now(IST)
+    if interval == 'min':
+        from_time = now - timedelta(minutes=60)
+    elif interval == 'hr':
+        from_time = now - timedelta(hours=24)
+    elif interval == 'day':
+        from_time = now - timedelta(days=30)
+    elif interval == 'month':
+        from_time = now - timedelta(days=365)
+    elif interval == 'year':
+        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
+
+    from_time_utc = from_time.astimezone(IST)
+
+    pipeline = [
+        {
+            "$match": {
+                "owner_name": owner_name,
+                "value_name": "energy_consumption"
+            }
+        },
+        {
+            "$addFields": {
+                "parsed_time": {"$toDate": "$time"}
+            }
+        },
+        {
+            "$match": {
+                "parsed_time": {"$gte": from_time_utc}
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$dateToString": {
+                        "format": date_format_map[interval],
+                        "date": "$parsed_time",
+                        "timezone": "Asia/Kolkata"
+                    }
                 },
-                "ghg_emission": {
-                    "$round": [
-                        {"$multiply": [
-                            {"$subtract": ["$max_energy", "$min_energy"]},
-                        1
-                        ]},
-                        6
-                    ]
-                }
+                "avg_energy": {"$avg": "$value"}
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "time": "$_id",
+                "energy": {"$round": ["$avg_energy", 6]}
             }
         },
         {
@@ -328,16 +383,30 @@ def get_energy_consumption(request):
         }
     ]
 
-    results = list(collection.aggregate(pipeline))
+    raw_results = list(collection.aggregate(pipeline))
+
+    # Compute energy difference: current - previous
+    diff_results = []
+    prev_energy = None
+    for entry in raw_results:
+        if prev_energy is not None:
+            energy_diff = round(entry['energy'] - prev_energy, 6)
+            diff_results.append({
+                "time": entry['time'],
+                "energy": max(energy_diff, 0)
+            })
+        prev_energy = entry['energy']
 
     return JsonResponse({
         "owner_name": owner_name,
         "interval": interval,
-        "data": results
+        "data": diff_results
     })
 
-from django.http import JsonResponse
 
+
+
+from django.http import JsonResponse
 def get_power_factor(request):
     owner_name = request.GET.get('owner')
     interval = request.GET.get('range')
@@ -363,6 +432,20 @@ def get_power_factor(request):
         "year": "%Y"
     }
 
+    now = datetime.now(IST)
+    if interval == 'min':
+        from_time = now - timedelta(minutes=60)
+    elif interval == 'hr':
+        from_time = now - timedelta(hours=24)
+    elif interval == 'day':
+        from_time = now - timedelta(days=30)
+    elif interval == 'month':
+        from_time = now.replace(day=1) - timedelta(days=365)
+    elif interval == 'year':
+        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
+
+    from_time_utc = from_time.astimezone(IST)
+
     pipeline = [
         {
             "$match": {
@@ -372,30 +455,35 @@ def get_power_factor(request):
         },
         {
             "$addFields": {
-                "group_time": {
-                    "$dateToString": {
-                        "format": date_format_map[interval],
-                        "date": {"$toDate": "$time"}
-                    }
-                }
+                "parsed_time": { "$toDate": "$time" }
+            }
+        },
+        {
+            "$match": {
+                "parsed_time": { "$gte": from_time_utc }
             }
         },
         {
             "$group": {
-                "_id": "$group_time",
-                "avg_power_factor": {"$avg": "$value"}
+                "_id": {
+                    "$dateToString": {
+                        "format": date_format_map[interval],
+                        "date": "$parsed_time",
+                        "timezone": "Asia/Kolkata"
+                    }
+                },
+                "avg_power_factor": { "$avg": "$value" }
             }
         },
         {
             "$project": {
+                "_id": 0,
                 "time": "$_id",
-                "power_factor": {
-                    "$round": ["$avg_power_factor", 3]
-                }
+                "power_factor": { "$round": ["$avg_power_factor", 3] }
             }
         },
         {
-            "$sort": {"time": 1}
+            "$sort": { "time": 1 }
         }
     ]
 
@@ -432,6 +520,20 @@ def get_current_stats(request):
         "year": "%Y"
     }
 
+    now = datetime.now(IST)
+    if interval == 'min':
+        from_time = now - timedelta(minutes=60)
+    elif interval == 'hr':
+        from_time = now - timedelta(hours=24)
+    elif interval == 'day':
+        from_time = now - timedelta(days=30)
+    elif interval == 'month':
+        from_time = now.replace(day=1) - timedelta(days=365)
+    elif interval == 'year':
+        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
+
+    from_time_utc = from_time.astimezone(IST)
+
     pipeline = [
         {
             "$match": {
@@ -441,28 +543,34 @@ def get_current_stats(request):
         },
         {
             "$addFields": {
-                "group_time": {
-                    "$dateToString": {
-                        "format": date_format_map[interval],
-                        "date": {"$toDate": "$time"}
-                    }
-                }
+                "parsed_time": { "$toDate": "$time" }
+            }
+        },
+        {
+            "$match": {
+                "parsed_time": { "$gte": from_time_utc }
             }
         },
         {
             "$group": {
                 "_id": {
-                    "time": "$group_time",
+                    "time": {
+                        "$dateToString": {
+                            "format": date_format_map[interval],
+                            "date": "$parsed_time",
+                            "timezone": "Asia/Kolkata"
+                        }
+                    },
                     "phase": "$value_name"
                 },
-                "avg_value": {"$avg": "$value"}
+                "avg_value": { "$avg": "$value" }
             }
         },
         {
             "$project": {
                 "time": "$_id.time",
                 "phase": "$_id.phase",
-                "value": {"$round": ["$avg_value", 2]}
+                "value": { "$round": ["$avg_value", 2] }
             }
         },
         {
@@ -501,7 +609,7 @@ def get_current_stats(request):
             }
         },
         {
-            "$sort": {"time": 1}
+            "$sort": { "time": 1 }
         }
     ]
 
@@ -512,6 +620,7 @@ def get_current_stats(request):
         "interval": interval,
         "data": results
     })
+
 
 def get_frequency_stats(request):
     owner_name = request.GET.get('owner')
@@ -538,6 +647,20 @@ def get_frequency_stats(request):
         "year": "%Y"
     }
 
+    now = datetime.now(IST)
+    if interval == 'min':
+        from_time = now - timedelta(minutes=60)
+    elif interval == 'hr':
+        from_time = now - timedelta(hours=24)
+    elif interval == 'day':
+        from_time = now - timedelta(days=30)
+    elif interval == 'month':
+        from_time = now.replace(day=1) - timedelta(days=365)
+    elif interval == 'year':
+        from_time = now.replace(month=1, day=1) - timedelta(days=365 * 5)
+
+    from_time_utc = from_time.astimezone(IST)
+
     pipeline = [
         {
             "$match": {
@@ -547,17 +670,23 @@ def get_frequency_stats(request):
         },
         {
             "$addFields": {
-                "group_time": {
-                    "$dateToString": {
-                        "format": date_format_map[interval],
-                        "date": {"$toDate": "$time"}
-                    }
-                }
+                "parsed_time": {"$toDate": "$time"}
+            }
+        },
+        {
+            "$match": {
+                "parsed_time": {"$gte": from_time_utc}
             }
         },
         {
             "$group": {
-                "_id": "$group_time",
+                "_id": {
+                    "$dateToString": {
+                        "format": date_format_map[interval],
+                        "date": "$parsed_time",
+                        "timezone": "Asia/Kolkata"
+                    }
+                },
                 "avg_frequency": {"$avg": "$value"}
             }
         },
