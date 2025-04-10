@@ -20,7 +20,8 @@ def publish_message(request):
 
 
 def get_unique_owners(request):
-    custom_order = [11, 12, 16, 17, 18, 13, 10, 7, 8, 9]
+    # Use strings if owner_name is stored as string
+    custom_order = ['11', '12', '16', '17', '18', '13', '10', '7', '8', '9']
 
     pipeline = [
         {
@@ -30,8 +31,9 @@ def get_unique_owners(request):
         }
     ]
     results = collection.aggregate(pipeline)
-    owners = [doc['_id'] for doc in results]
+    owners = [str(doc['_id']) for doc in results]  # make sure all IDs are strings
 
+    # Sort by custom order
     ordered_owners = sorted(owners, key=lambda x: custom_order.index(x) if x in custom_order else float('inf'))
 
     return JsonResponse({"unique_owners": ordered_owners})
