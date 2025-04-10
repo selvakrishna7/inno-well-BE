@@ -20,19 +20,21 @@ def publish_message(request):
 
 
 def get_unique_owners(request):
+    custom_order = [11, 12, 16, 17, 18, 13, 10, 7, 8, 9]
+
     pipeline = [
         {
             "$group": {
                 "_id": "$owner_name"
             }
-        },
-        {
-            '$sort':{'_id':1}
         }
     ]
     results = collection.aggregate(pipeline)
     owners = [doc['_id'] for doc in results]
-    return JsonResponse({"unique_owners": owners})
+
+    ordered_owners = sorted(owners, key=lambda x: custom_order.index(x) if x in custom_order else float('inf'))
+
+    return JsonResponse({"unique_owners": ordered_owners})
 
 
 def compute_energy_consumption(owner_name, start_time, end_time):
