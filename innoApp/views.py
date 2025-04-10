@@ -27,7 +27,7 @@ def get_unique_owners(request):
             }
         },
         {
-            '$sort':{'_id':-1}
+            '$sort':{'_id':1}
         }
     ]
     results = collection.aggregate(pipeline)
