@@ -25,11 +25,13 @@ def get_unique_owners(request):
             "$group": {
                 "_id": "$owner_name"
             }
+        },
+        {
+            '$sort':{'_id':-1}
         }
     ]
     results = collection.aggregate(pipeline)
     owners = [doc['_id'] for doc in results]
-    print(owners)
     return JsonResponse({"unique_owners": owners})
 
 
@@ -527,7 +529,7 @@ def get_power_factor(request):
     if interval == 'min':
         start = now.replace(second=0, microsecond=0, minute=0)
         end = start + timedelta(hours=1)
-    elif interval == 'hr':
+    elif interval == 'hr': 
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
     elif interval == 'day':
